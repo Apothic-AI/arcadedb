@@ -1,0 +1,99 @@
+# fly.headless.toml - ArcadeDB Headless Variant
+# Optimized for fastest cold starts - API-only deployment
+# Excludes: Gremlin, Redis, MongoDB, GraphQL protocols, Studio (web UI)
+# Includes: HTTP API, PostgreSQL wire protocol, gRPC, Binary replication
+
+# PREREQUISITES:
+# 1. Run Maven build first: mvn clean install -Pdocker
+# 2. This creates: package/target/arcadedb-<version>-headless.dir/
+# 3. Deploy with: fly deploy -c fly.headless.toml
+
+app = "arcadedb-headless"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  # Maven creates this directory with the Dockerfile during -Pdocker build
+  # Update the path if using a different version
+  dockerfile = "package/src/main/docker/Dockerfile"
+  # Build context points to Maven's assembled headless distribution
+  # NOTE: Update version number to match your build (check package/pom.xml)
+  [build.args]
+    # Context is relative to repo root where fly.toml is located
+    BUILD_CONTEXT = "package/target/arcadedb-25.12.1-SNAPSHOT-headless.dir"
+
+[env]
+  # Optimize for lowest memory usage (fastest cold starts)
+  ARCADEDB_OPTS_MEMORY = "-Xms512M -Xmx1G"
+  # Use ZGC for low-latency garbage collection
+  JAVA_OPTS = "-XX:+UseZGC -XX:+ZGenerational"
+  # Disable JMX to reduce overhead (uncomment if needed for monitoring)
+  # ARCADEDB_JMX = ""
+
+[http_service]
+  internal_port = 2480
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  # Health check on HTTP API
+  [http_service.checks]
+    [http_service.checks.alive]
+      type = "http"
+      interval = "15s"
+      timeout = "5s"
+      grace_period = "30s"
+      method = "GET"
+      path = "/api/v1/ready"
+      protocol = "http"
+      [http_service.checks.alive.headers]
+        # Add basic auth if needed
+        # Authorization = "Basic <base64-encoded-credentials>"
+
+# PostgreSQL wire protocol support (headless variant includes this)
+[[services]]
+  protocol = "tcp"
+  internal_port = 5432
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 5432
+
+# Binary replication protocol (for HA clustering)
+[[services]]
+  protocol = "tcp"
+  internal_port = 2424
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 2424
+
+# gRPC service (headless variant includes this)
+[[services]]
+  protocol = "tcp"
+  internal_port = 50051
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 50051
+
+# Persistent storage for database files
+[mounts]
+  source = "arcadedb_data"
+  destination = "/home/arcadedb/databases"
+  initial_size = "10GB"
+
+# VM resources - optimized for fastest cold starts (lightest variant)
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1

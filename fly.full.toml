@@ -1,0 +1,132 @@
+# fly.full.toml - ArcadeDB Full Variant
+# Complete feature set with all protocols and Studio web UI
+# Includes: HTTP API, Studio, Gremlin, Redis, MongoDB, GraphQL, PostgreSQL, gRPC, Binary replication
+# Larger image but provides all functionality
+
+# PREREQUISITES:
+# 1. Run Maven build first: mvn clean install -Pdocker
+# 2. This creates: package/target/arcadedb-<version>.dir/
+# 3. Deploy with: fly deploy -c fly.full.toml
+
+app = "arcadedb-full"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  # Maven creates this directory with the Dockerfile during -Pdocker build
+  # Update the path if using a different version
+  dockerfile = "package/src/main/docker/Dockerfile"
+  # Build context points to Maven's assembled full distribution
+  # NOTE: Update version number to match your build (check package/pom.xml)
+  [build.args]
+    # Context is relative to repo root where fly.toml is located
+    BUILD_CONTEXT = "package/target/arcadedb-25.12.1-SNAPSHOT.dir"
+
+[env]
+  # Full variant needs more memory for all protocol handlers
+  ARCADEDB_OPTS_MEMORY = "-Xms1G -Xmx2G"
+  # Use ZGC for low-latency garbage collection
+  JAVA_OPTS = "-XX:+UseZGC -XX:+ZGenerational"
+  # Disable JMX to reduce overhead (uncomment if needed for monitoring)
+  # ARCADEDB_JMX = ""
+
+[http_service]
+  internal_port = 2480
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  # Health check on HTTP API
+  [http_service.checks]
+    [http_service.checks.alive]
+      type = "http"
+      interval = "15s"
+      timeout = "5s"
+      grace_period = "30s"
+      method = "GET"
+      path = "/api/v1/ready"
+      protocol = "http"
+      [http_service.checks.alive.headers]
+        # Add basic auth if needed
+        # Authorization = "Basic <base64-encoded-credentials>"
+
+# PostgreSQL wire protocol
+[[services]]
+  protocol = "tcp"
+  internal_port = 5432
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 5432
+
+# MongoDB wire protocol (full variant only)
+[[services]]
+  protocol = "tcp"
+  internal_port = 27017
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 27017
+
+# Redis wire protocol (full variant only)
+[[services]]
+  protocol = "tcp"
+  internal_port = 6379
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 6379
+
+# Gremlin Server / Apache TinkerPop (full variant only)
+[[services]]
+  protocol = "tcp"
+  internal_port = 8182
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 8182
+
+# Binary replication protocol (for HA clustering)
+[[services]]
+  protocol = "tcp"
+  internal_port = 2424
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 2424
+
+# gRPC service
+[[services]]
+  protocol = "tcp"
+  internal_port = 50051
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 50051
+
+# Persistent storage for database files
+[mounts]
+  source = "arcadedb_data"
+  destination = "/home/arcadedb/databases"
+  initial_size = "10GB"
+
+# VM resources - full variant needs more memory for all protocol handlers
+[[vm]]
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 1
