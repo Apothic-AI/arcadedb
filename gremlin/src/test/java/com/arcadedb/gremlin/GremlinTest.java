@@ -19,6 +19,7 @@
 package com.arcadedb.gremlin;
 
 import com.arcadedb.GlobalConfiguration;
+import com.arcadedb.cypher.ArcadeCypher;
 import com.arcadedb.database.Database;
 import com.arcadedb.database.DatabaseFactory;
 import com.arcadedb.database.EmbeddedDocument;

@@ -237,6 +237,153 @@ class CypherTest {
     }
   }
 
+  // https://github.com/ArcadeData/arcadedb/issues/3118
+  @Test
+  void testUnwindEmptyArrayWithMerge() {
+    final ArcadeGraph graph = ArcadeGraph.open("./target/testgremlin");
+    try {
+      // Test with AUTO engine first to see the fallback behavior
+      // Force Groovy engine to see if that fixes the issue
+      GlobalConfiguration.GREMLIN_ENGINE.setValue("groovy");
+
+      graph.database.command("sqlscript",//
+              "CREATE VERTEX TYPE CHUNK;" + //
+                      "CREATE PROPERTY CHUNK.subtype STRING;" +//
+                      "CREATE PROPERTY CHUNK.name STRING;" +//
+                      "CREATE PROPERTY CHUNK.text STRING;" +//
+                      "CREATE PROPERTY CHUNK.index INTEGER;" +//
+                      "CREATE PROPERTY CHUNK.pages STRING;");
+
+      // Test the original failing query from issue #3118
+      String originalQuery = "UNWIND [] AS BatchEntry " +
+              "MERGE (n:CHUNK { subtype: BatchEntry.subtype, name: BatchEntry.name, " +
+              "text: BatchEntry.text, index: BatchEntry.index, pages: BatchEntry.pages }) " +
+              "return ID(n) as id";
+
+      final ResultSet result = graph.database.query("cypher", originalQuery);
+
+      // Empty array should return no results
+      assertThat(result.hasNext()).isFalse();
+
+    } finally {
+      graph.drop();
+      GlobalConfiguration.GREMLIN_ENGINE.reset();
+    }
+  }
+
+  /**
+   * Issue #2908: Cannot create a node with cypher when there is an LSM vector index existing for it
+   * https://github.com/ArcadeData/arcadedb/issues/2908
+   */
+  @Test
+  void issue2908_vectorIndexWithCypher() {
+    final ArcadeGraph graph = ArcadeGraph.open("./target/testcypher");
+    try {
+      graph.getDatabase().transaction(() -> {
+        // Create vertex type with vector property and LSM vector index
+        graph.getDatabase().command("sql", "CREATE VERTEX TYPE EmbeddingNode");
+        graph.getDatabase().command("sql", "CREATE PROPERTY EmbeddingNode.vector ARRAY_OF_FLOATS");
+        graph.getDatabase().command("sql",
+            "CREATE INDEX ON EmbeddingNode (vector) LSM_VECTOR METADATA {dimensions: 4, similarity: 'COSINE'}");
+
+        // Create vertex type without index for comparison
+        graph.getDatabase().command("sql", "CREATE VERTEX TYPE EmbeddingNode2");
+        graph.getDatabase().command("sql", "CREATE PROPERTY EmbeddingNode2.vector ARRAY_OF_FLOATS");
+      });
+
+      // First test with SQL INSERT to ensure the index works
+      graph.getDatabase().transaction(() -> {
+        graph.getDatabase().command("sql", "INSERT INTO EmbeddingNode SET vector = [1.0, 2.0, 3.0, 4.0]");
+      });
+
+      // Verify SQL insert worked
+      final com.arcadedb.query.sql.executor.ResultSet sqlResult = graph.getDatabase().query("sql", "SELECT FROM EmbeddingNode");
+      assertThat(sqlResult.hasNext()).as("SQL insert should have created a node").isTrue();
+      sqlResult.close();
+
+      // Now test direct Gremlin/TinkerPop vertex creation with properties in addVertex
+      graph.getDatabase().transaction(() -> {
+        final org.apache.tinkerpop.gremlin.structure.Vertex v = graph.addVertex(
+            org.apache.tinkerpop.gremlin.structure.T.label, "EmbeddingNode",
+            "vector", java.util.List.of(2.0f, 3.0f, 4.0f, 5.0f)
+        );
+      });
+
+      // Now test Cypher with vector index
+      final ResultSet result1 = graph.cypher("CREATE (node1:EmbeddingNode {vector: [0.0, 0.0, 0.0, 0.0]}) RETURN node1").execute();
+      assertThat(result1.hasNext()).as("Should create node with vector index").isTrue();
+      final Result row1 = result1.next();
+      assertThat(row1.getIdentity().isPresent()).as("Node should have an identity").isTrue();
+
+    } finally {
+      graph.drop();
+    }
+  }
+
+  /**
+   * Issue #2342: java.lang.UnsupportedOperationException on Cypher query with ALL() and keys()
+   * https://github.com/ArcadeData/arcadedb/issues/2342
+   */
+  @Test
+  void issue2342_allWithKeys() {
+    final ArcadeGraph graph = ArcadeGraph.open("./target/testcypher");
+    try {
+      graph.getDatabase().getSchema().getOrCreateVertexType("Person");
+
+      // Create test data with various properties
+      graph.getDatabase().transaction(() -> {
+        graph.getDatabase().newVertex("Person").set("name", "Alice").set("age", 30).set("city", "NYC").save();
+        graph.getDatabase().newVertex("Person").set("name", "Bob").set("age", 25).set("city", "LA").save();
+        graph.getDatabase().newVertex("Person").set("name", "Charlie").set("age", 30).set("city", "NYC").save();
+      });
+
+      // Test 1: Match with multiple properties
+      final Map<String, Object> props = Map.of("age", 30, "city", "NYC");
+
+      final ResultSet result = graph.cypher(
+          "MATCH (n:Person) WHERE ALL(k IN keys($props) WHERE n[k] = $props[k]) RETURN n"
+      ).setParameter("props", props).execute();
+
+      // Should return Alice and Charlie who both have age=30 and city="NYC"
+      int count = 0;
+      while (result.hasNext()) {
+        final Result row = result.next();
+        // Verify the matched nodes have the correct properties
+        assertThat(row.<String>getProperty("name")).isIn("Alice", "Charlie");
+        assertThat(row.<Integer>getProperty("age")).isEqualTo(30);
+        assertThat(row.<String>getProperty("city")).isEqualTo("NYC");
+        count++;
+      }
+      assertThat(count == 2).isTrue();
+
+      // Test 2: Match with single property
+      final Map<String, Object> singleProp = Map.of("city", "LA");
+      final ResultSet result2 = graph.cypher(
+          "MATCH (n:Person) WHERE ALL(k IN keys($props) WHERE n[k] = $props[k]) RETURN n"
+      ).setParameter("props", singleProp).execute();
+
+      count = 0;
+      while (result2.hasNext()) {
+        final Result row = result2.next();
+        assertThat(row.<String>getProperty("name")).isEqualTo("Bob");
+        assertThat(row.<String>getProperty("city")).isEqualTo("LA");
+        count++;
+      }
+      assertThat(count == 1).isTrue();
+
+      // Test 3: Match with property that doesn't exist on any node - should return no results
+      final Map<String, Object> nonExistentProp = Map.of("country", "USA");
+      final ResultSet result3 = graph.cypher(
+          "MATCH (n:Person) WHERE ALL(k IN keys($props) WHERE n[k] = $props[k]) RETURN n"
+      ).setParameter("props", nonExistentProp).execute();
+
+      assertThat(result3.hasNext()).isFalse();
+
+    } finally {
+      graph.drop();
+    }
+  }
+
   @BeforeEach
   @AfterEach
   void clean() {

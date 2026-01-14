@@ -184,6 +184,7 @@ public class TypeLSMVectorIndexBuilder extends TypeIndexBuilder {
 
   public void withMetadata(final JSONObject json) {
     final LSMVectorIndexMetadata v = ((LSMVectorIndexMetadata) metadata);
+
     if (json.has("dimensions"))
       v.dimensions = json.getInt("dimensions");
 
@@ -207,5 +208,18 @@ public class TypeLSMVectorIndexBuilder extends TypeIndexBuilder {
 
     if (json.has("idPropertyName"))
       v.idPropertyName = json.getString("idPropertyName");
+
+    // Phase 2: New configuration options
+    if (json.has("locationCacheSize"))
+      v.locationCacheSize = json.getInt("locationCacheSize");
+
+    if (json.has("graphBuildCacheSize"))
+      v.graphBuildCacheSize = json.getInt("graphBuildCacheSize");
+
+    if (json.has("mutationsBeforeRebuild"))
+      v.mutationsBeforeRebuild = json.getInt("mutationsBeforeRebuild");
+
+    if (json.has("storeVectorsInGraph"))
+      v.storeVectorsInGraph = json.getBoolean("storeVectorsInGraph");
   }
 }

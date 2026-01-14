@@ -18,11 +18,15 @@
  */
 package com.arcadedb.index.vector;
 
+import com.arcadedb.GlobalConfiguration;
 import com.arcadedb.database.Binary;
 import com.arcadedb.database.DatabaseInternal;
 import com.arcadedb.database.Document;
 import com.arcadedb.database.Identifiable;
 import com.arcadedb.database.RID;
+import com.arcadedb.database.Record;
+import com.arcadedb.database.TransactionContext;
+import com.arcadedb.database.TransactionIndexContext;
 import com.arcadedb.engine.BasePage;
 import com.arcadedb.engine.Component;
 import com.arcadedb.engine.ComponentFactory;
@@ -95,7 +99,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
   private final String                 indexName;
   protected     LSMVectorIndexMutable  mutable;
   private final ReentrantReadWriteLock lock;
-  private       LSMVectorIndexMetadata metadata;
+  LSMVectorIndexMetadata metadata; // Package-private for Phase 2 access from ArcadePageVectorValues and LSMVectorIndexGraphFile
 
   // Graph lifecycle management (Phase 2: Disk-based graph storage)
   enum GraphState {
@@ -126,6 +130,24 @@ public class LSMVectorIndex implements Index, IndexInternal {
   private final int                     minPagesToScheduleACompaction;
   private       LSMVectorIndexCompacted compactedSubIndex;
   private       boolean                 valid = true;
+
+  // Page tracking for inserts (avoids getTotalPages() issue with transaction-local pages)
+  // Protected by write lock, reset to -1 after transaction commits or graph rebuilds
+  private int currentInsertPageNum = -1;
+
+  // Metrics tracking (Phase 1: JVector metrics extraction)
+  // Package-private to allow access from ArcadePageVectorValues
+  final AtomicLong searchOperations       = new AtomicLong(0);
+  final AtomicLong insertOperations       = new AtomicLong(0);
+  final AtomicLong graphRebuildCount      = new AtomicLong(0);
+  final AtomicLong compactionCount        = new AtomicLong(0);
+  final AtomicLong vectorCacheHits        = new AtomicLong(0);
+  final AtomicLong vectorCacheMisses      = new AtomicLong(0);
+  final AtomicLong vectorFetchFromQuantized = new AtomicLong(0);
+  final AtomicLong vectorFetchFromDocuments = new AtomicLong(0);
+  final AtomicLong vectorFetchFromGraph   = new AtomicLong(0);
+  final AtomicLong searchLatencyMs        = new AtomicLong(0);
+  final AtomicLong insertLatencyMs        = new AtomicLong(0);
 
   public interface GraphBuildCallback {
     /**
@@ -247,7 +269,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
       return new LSMVectorIndex(builder.getDatabase(), builder.getIndexName(), builder.getFilePath(), ComponentFile.MODE.READ_WRITE,
           builder.getPageSize(), vectorBuilder.getTypeName(), vectorBuilder.getPropertyNames(), vectorBuilder.dimensions,
           vectorBuilder.similarityFunction, vectorBuilder.maxConnections, vectorBuilder.beamWidth, vectorBuilder.idPropertyName,
-          vectorBuilder.quantizationType);
+          vectorBuilder.quantizationType, vectorBuilder.locationCacheSize, vectorBuilder.graphBuildCacheSize,
+          vectorBuilder.mutationsBeforeRebuild, vectorBuilder.storeVectorsInGraph);
     }
   }
 
@@ -270,7 +293,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
   public LSMVectorIndex(final DatabaseInternal database, final String name, final String filePath, final ComponentFile.MODE mode,
       final int pageSize, final String typeName, final String[] propertyNames, final int dimensions,
       final VectorSimilarityFunction similarityFunction, final int maxConnections, final int beamWidth, final String idPropertyName,
-      final VectorQuantizationType quantizationType) {
+      final VectorQuantizationType quantizationType, final int locationCacheSize, final int graphBuildCacheSize,
+      final int mutationsBeforeRebuild, final boolean storeVectorsInGraph) {
     try {
       this.indexName = name;
 
@@ -281,6 +305,10 @@ public class LSMVectorIndex implements Index, IndexInternal {
       this.metadata.maxConnections = maxConnections;
       this.metadata.beamWidth = beamWidth;
       this.metadata.idPropertyName = idPropertyName;
+      this.metadata.locationCacheSize = locationCacheSize;
+      this.metadata.graphBuildCacheSize = graphBuildCacheSize;
+      this.metadata.mutationsBeforeRebuild = mutationsBeforeRebuild;
+      this.metadata.storeVectorsInGraph = storeVectorsInGraph;
 
       this.lock = new ReentrantReadWriteLock();
       this.vectorIndex = new VectorLocationIndex(getLocationCacheSize(database));
@@ -295,7 +323,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
       // Initialize compaction fields
       this.currentMutablePages = new AtomicInteger(0); // No page0 - start with 0 pages
       this.minPagesToScheduleACompaction = database.getConfiguration()
-          .getValueAsInteger(com.arcadedb.GlobalConfiguration.INDEX_COMPACTION_MIN_PAGES_SCHEDULE);
+          .getValueAsInteger(GlobalConfiguration.INDEX_COMPACTION_MIN_PAGES_SCHEDULE);
       this.compactedSubIndex = null;
 
       // Create the component that handles page storage
@@ -350,7 +378,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
     // Initialize compaction fields
     this.currentMutablePages = new AtomicInteger(mutable.getTotalPages());
     this.minPagesToScheduleACompaction = database.getConfiguration()
-        .getValueAsInteger(com.arcadedb.GlobalConfiguration.INDEX_COMPACTION_MIN_PAGES_SCHEDULE);
+        .getValueAsInteger(GlobalConfiguration.INDEX_COMPACTION_MIN_PAGES_SCHEDULE);
 
     // Discover and load compacted sub-index file if it exists (critical for replicas after compaction)
     LogManager.instance().log(this, Level.FINE, "Attempting to discover compacted sub-index for index: %s", null, name);
@@ -526,8 +554,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
         if (file != null && LSMVectorIndexGraphFile.FILE_EXT.equals(file.getFileExtension()) && file.getComponentName()
             .equals(expectedGraphFileName)) {
 
-          final int pageSize = file instanceof com.arcadedb.engine.PaginatedComponentFile ?
-              ((com.arcadedb.engine.PaginatedComponentFile) file).getPageSize() :
+          final int pageSize = file instanceof PaginatedComponentFile ?
+              ((PaginatedComponentFile) file).getPageSize() :
               mutable.getPageSize();
 
           final LSMVectorIndexGraphFile graphFile = new LSMVectorIndexGraphFile(database, file.getComponentName(),
@@ -567,7 +595,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
       }
 
       // No persisted graph - build now for new indexes
-      LogManager.instance().log(this, Level.INFO, "Building graph from scratch for index: %s", indexName);
+      LogManager.instance().log(this, Level.SEVERE, "DEBUG: initializeGraphIndex building graph for %s, vectorIndex.size=%d", indexName, vectorIndex.size());
 
       // NOTE: buildGraphFromScratch() manages locking internally
       // Don't hold lock here - JVector uses parallel threads during graph build
@@ -596,9 +624,58 @@ public class LSMVectorIndex implements Index, IndexInternal {
           this.graphState = GraphState.IMMUTABLE;
 
           // Rebuild ordinalToVectorId from vectorIndex
+          // IMPORTANT: Must match the validation logic used during graph building
+          final String vectorProp =
+              metadata.propertyNames != null && !metadata.propertyNames.isEmpty() ? metadata.propertyNames.getFirst() : "vector";
+
           this.ordinalToVectorId = vectorIndex.getAllVectorIds().filter(id -> {
             final VectorLocationIndex.VectorLocation loc = vectorIndex.getLocation(id);
-            return loc != null && !loc.deleted;
+            if (loc == null || loc.deleted) {
+              return false;
+            }
+
+            // Re-validate vectors to match graph building logic
+            if (metadata.quantizationType != VectorQuantizationType.NONE) {
+              // With quantization: verify we can read the quantized vector
+              try {
+                final float[] vector = readVectorFromOffset(loc.absoluteFileOffset, loc.isCompacted);
+                if (vector == null || vector.length != metadata.dimensions) {
+                  return false;
+                }
+                // Check not all zeros
+                for (float v : vector) {
+                  if (v != 0.0f) {
+                    return true;
+                  }
+                }
+                return false;  // All zeros
+              } catch (final Exception e) {
+                return false;
+              }
+            } else {
+              // Without quantization: validate by reading from document
+              try {
+                final Record record = getDatabase().lookupByRID(loc.rid, false);
+                if (record == null) {
+                  return false;
+                }
+                final Document doc = (Document) record;
+                final Object vectorObj = doc.get(vectorProp);
+                final float[] vector = VectorUtils.convertToFloatArray(vectorObj);
+                if (vector == null || vector.length != metadata.dimensions) {
+                  return false;
+                }
+                // Check not all zeros
+                for (float v : vector) {
+                  if (v != 0.0f) {
+                    return true;
+                  }
+                }
+                return false;  // All zeros
+              } catch (final Exception e) {
+                return false;
+              }
+            }
           }).sorted().toArray();
 
           LogManager.instance().log(this, Level.INFO,
@@ -648,7 +725,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
     // CRITICAL FIX: Collect vectors DIRECTLY from pages instead of from vectorIndex.
     // This avoids race conditions where concurrent replication adds entries to vectorIndex
     // that don't yet exist on disk pages. We iterate pages and read what's actually persisted.
-    final java.util.Map<RID, VectorEntryForGraphBuild> ridToLatestVector = new java.util.HashMap<>();
+    final Map<RID, VectorEntryForGraphBuild> ridToLatestVector = new HashMap<>();
     int totalEntriesRead = 0;
     int filteredZeroVectors = 0;
     int filteredDeletedVectors = 0;
@@ -705,6 +782,31 @@ public class LSMVectorIndex implements Index, IndexInternal {
             // Read deleted flag (fixed 1 byte)
             final boolean deleted = page.readByte(currentOffset) == 1;
             currentOffset += 1;
+
+            // CRITICAL: Skip over quantization type byte (always present after my fix)
+            final byte quantTypeOrdinal = page.readByte(currentOffset);
+            currentOffset += 1;
+
+            // CRITICAL: Skip over quantized vector data if quantization is enabled
+            if (quantTypeOrdinal == VectorQuantizationType.INT8.ordinal()) {
+              // Skip vector length (4 bytes)
+              final int vectorLength = page.readInt(currentOffset);
+              currentOffset += 4;
+              // Skip quantized bytes
+              currentOffset += vectorLength;
+              // Skip min and max (2 floats = 8 bytes)
+              currentOffset += 8;
+            } else if (quantTypeOrdinal == VectorQuantizationType.BINARY.ordinal()) {
+              // Skip original length (4 bytes)
+              final int originalLength = page.readInt(currentOffset);
+              currentOffset += 4;
+              // Skip packed bytes
+              final int byteCount = (originalLength + 7) / 8;
+              currentOffset += byteCount;
+              // Skip median (4 bytes)
+              currentOffset += 4;
+            }
+            // If quantType is NONE (0), no additional data to skip
 
             totalEntriesRead++;
 
@@ -770,6 +872,31 @@ public class LSMVectorIndex implements Index, IndexInternal {
           // Read deleted flag (fixed 1 byte)
           final boolean deleted = page.readByte(currentOffset) == 1;
           currentOffset += 1;
+
+          // CRITICAL: Skip over quantization type byte (always present after my fix)
+          final byte quantTypeOrdinal = page.readByte(currentOffset);
+          currentOffset += 1;
+
+          // CRITICAL: Skip over quantized vector data if quantization is enabled
+          if (quantTypeOrdinal == VectorQuantizationType.INT8.ordinal()) {
+            // Skip vector length (4 bytes)
+            final int vectorLength = page.readInt(currentOffset);
+            currentOffset += 4;
+            // Skip quantized bytes
+            currentOffset += vectorLength;
+            // Skip min and max (2 floats = 8 bytes)
+            currentOffset += 8;
+          } else if (quantTypeOrdinal == VectorQuantizationType.BINARY.ordinal()) {
+            // Skip original length (4 bytes)
+            final int originalLength = page.readInt(currentOffset);
+            currentOffset += 4;
+            // Skip packed bytes
+            final int byteCount = (originalLength + 7) / 8;
+            currentOffset += byteCount;
+            // Skip median (4 bytes)
+            currentOffset += 4;
+          }
+          // If quantType is NONE (0), no additional data to skip
 
           totalEntriesRead++;
 
@@ -848,20 +975,26 @@ public class LSMVectorIndex implements Index, IndexInternal {
       int validatedCount = 0;
       final long VALIDATION_PROGRESS_INTERVAL = 1000;
 
+      int validationAttempts = 0;
+      int validationSuccesses = 0;
+      int validationNullVectors = 0;
+      int validationWrongDimensions = 0;
+      int validationAllZeros = 0;
+
       for (int vectorId : vectorIds) {
         final VectorLocationIndex.VectorLocation loc = vectorIndex.getLocation(vectorId);
         if (loc != null && !loc.deleted) {
-          // Validate that the document still exists and has a valid vector
-          try {
-            final com.arcadedb.database.Record record = getDatabase().lookupByRID(loc.rid, false);
-            if (record != null) {
-              final com.arcadedb.database.Document doc = (com.arcadedb.database.Document) record;
-              final Object vectorObj = doc.get(vectorProp);
+          validationAttempts++;
 
-              final float[] vector = VectorUtils.convertToFloatArray(vectorObj);
-
+          // CRITICAL FIX: When quantization is enabled, vectors are stored in index pages, not documents
+          // Skip expensive document validation and trust the page data we already read
+          if (metadata.quantizationType != VectorQuantizationType.NONE) {
+            // With quantization: vectors are in index pages, document validation not needed
+            // Just validate that we can read the quantized vector
+            try {
+              final float[] vector = readVectorFromOffset(loc.absoluteFileOffset, loc.isCompacted);
               if (vector != null && vector.length == metadata.dimensions) {
-                // Validate vector is not all zeros (would cause NaN in cosine similarity)
+                // Validate vector is not all zeros
                 boolean hasNonZero = false;
                 for (float v : vector) {
                   if (v != 0.0f) {
@@ -872,15 +1005,56 @@ public class LSMVectorIndex implements Index, IndexInternal {
                 if (hasNonZero) {
                   vectorLocationSnapshot.put(vectorId, loc);
                   validVectorIds.add(vectorId);
+                  validationSuccesses++;
+                } else {
+                  validationAllZeros++;
+                  skippedDeletedDocs++;
+                }
+              } else {
+                // Could not read quantized vector - skip
+                if (vector == null) {
+                  validationNullVectors++;
+                } else {
+                  validationWrongDimensions++;
+                }
+                skippedDeletedDocs++;
+              }
+            } catch (final Exception e) {
+              // Error reading quantized vector - skip
+              skippedDeletedDocs++;
+            }
+          } else {
+            // Without quantization: validate by reading from document
+            try {
+              final Record record = getDatabase().lookupByRID(loc.rid, false);
+              if (record != null) {
+                final Document doc = (Document) record;
+                final Object vectorObj = doc.get(vectorProp);
+
+                final float[] vector = VectorUtils.convertToFloatArray(vectorObj);
+
+                if (vector != null && vector.length == metadata.dimensions) {
+                  // Validate vector is not all zeros (would cause NaN in cosine similarity)
+                  boolean hasNonZero = false;
+                  for (float v : vector) {
+                    if (v != 0.0f) {
+                      hasNonZero = true;
+                      break;
+                    }
+                  }
+                  if (hasNonZero) {
+                    vectorLocationSnapshot.put(vectorId, loc);
+                    validVectorIds.add(vectorId);
+                  }
                 }
               }
+            } catch (final RecordNotFoundException e) {
+              // Document was deleted - skip this vector
+              skippedDeletedDocs++;
+            } catch (final Exception e) {
+              // Other errors - skip this vector
+              skippedDeletedDocs++;
             }
-          } catch (final RecordNotFoundException e) {
-            // Document was deleted - skip this vector
-            skippedDeletedDocs++;
-          } catch (final Exception e) {
-            // Other errors - skip this vector
-            skippedDeletedDocs++;
           }
         }
 
@@ -902,7 +1076,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
       }
 
       // Use validated vector IDs instead of unfiltered ones
-      final int[] filteredVectorIds = validVectorIds.stream().mapToInt(Integer::intValue).toArray();
+      // IMPORTANT: Must be sorted to match the ordinal order used when loading from disk
+      final int[] filteredVectorIds = validVectorIds.stream().sorted().mapToInt(Integer::intValue).toArray();
       this.ordinalToVectorId = filteredVectorIds;
       finalActiveVectorIds = filteredVectorIds;
 
@@ -1004,6 +1179,10 @@ public class LSMVectorIndex implements Index, IndexInternal {
       try {
         this.graphIndex = builtGraph;
         this.graphState = GraphState.IMMUTABLE;
+        // Track graph rebuild metric
+        graphRebuildCount.incrementAndGet();
+        // Reset page tracking since we rebuilt from persisted pages
+        currentInsertPageNum = -1;
       } finally {
         lock.writeLock().unlock();
       }
@@ -1039,6 +1218,16 @@ public class LSMVectorIndex implements Index, IndexInternal {
           } else {
             LogManager.instance()
                 .log(this, Level.FINE, "Vector graph persisted (transaction managed by caller) for index: %s", indexName);
+          }
+
+          // Phase 2: Note - we don't reload the graph immediately as OnDiskGraphIndex here because:
+          // 1. The in-memory OnHeapGraphIndex works perfectly for searches
+          // 2. Page visibility issues after commit make immediate reload unreliable
+          // 3. On next database restart, ensureGraphAvailable() will load it as OnDiskGraphIndex
+          // 4. The inline vectors will be available when loaded from disk on restart
+          if (metadata.storeVectorsInGraph) {
+            LogManager.instance().log(this, Level.INFO,
+                "Graph persisted with inline vectors - will use OnDiskGraphIndex on next database open");
           }
         } catch (final Exception e) {
           // Rollback on error
@@ -1136,6 +1325,9 @@ public class LSMVectorIndex implements Index, IndexInternal {
               ", compactedFileId=" + compactedSubIndex.getFileId() + ", compactedPages=" + compactedSubIndex.getTotalPages() :
               ""));
 
+      // Reset page tracking after loading from disk
+      currentInsertPageNum = -1;
+
       // NOTE: Do NOT call initializeGraphIndex() here - it would cause infinite recursion
       // because buildGraphFromScratch() calls loadVectorsFromPages()
       // Graph initialization is handled separately by the constructor and ensureGraphAvailable()
@@ -1221,13 +1413,14 @@ public class LSMVectorIndex implements Index, IndexInternal {
           final boolean deleted = currentPage.readByte(currentOffset) == 1;
           currentOffset += 1;
 
+          // CRITICAL FIX: Always read quantization type byte (matches writer that always writes it)
+          // The writer ALWAYS writes this byte, even when quantization is NONE
+          final byte quantTypeOrdinal = currentPage.readByte(currentOffset);
+          currentOffset += 1;
+
           // Skip quantized vector data if quantization is enabled
           // This data is not needed for location index, only for vector retrieval
-          if (metadata.quantizationType != VectorQuantizationType.NONE) {
-            // Read quantization type flag
-            final byte quantTypeOrdinal = currentPage.readByte(currentOffset);
-            currentOffset += 1;
-
+          if (quantTypeOrdinal > 0 && quantTypeOrdinal < VectorQuantizationType.values().length) {
             final VectorQuantizationType quantType = VectorQuantizationType.values()[quantTypeOrdinal];
 
             if (quantType == VectorQuantizationType.INT8) {
@@ -1277,10 +1470,10 @@ public class LSMVectorIndex implements Index, IndexInternal {
       final int bucketIdSize = Binary.getNumberSpace(rid.getBucketId());
       final int positionSize = Binary.getNumberSpace(rid.getPosition());
       int entrySize = vectorIdSize + positionSize + bucketIdSize + 1; // +1 for deleted byte
+      entrySize += 1; // +1 for quantization type flag (ALWAYS written, even if NONE)
 
       // Add size for quantized vector data if quantization is enabled
       if (qmeta != null) {
-        entrySize += 1; // quantization type flag
         if (qmeta.getType() == VectorQuantizationType.INT8) {
           final VectorQuantizationMetadata.Int8QuantizationMetadata int8meta = (VectorQuantizationMetadata.Int8QuantizationMetadata) qmeta;
           entrySize += 4; // vector length (int)
@@ -1294,11 +1487,17 @@ public class LSMVectorIndex implements Index, IndexInternal {
         }
       }
 
-      // Get or create the last mutable page
-      int lastPageNum = getTotalPages() - 1;
+      // CRITICAL FIX: Use tracked page number to handle transaction-local pages correctly
+      // Initialize from persisted pages only if not set (-1)
+      int lastPageNum = currentInsertPageNum;
       if (lastPageNum < 0) {
-        lastPageNum = 0;
-        createNewVectorDataPage(lastPageNum);
+        // First insert in this session - initialize from persisted pages
+        lastPageNum = getTotalPages() - 1;
+        if (lastPageNum < 0) {
+          lastPageNum = 0;
+          createNewVectorDataPage(lastPageNum);
+        }
+        currentInsertPageNum = lastPageNum;
       }
 
       // Get current page
@@ -1317,6 +1516,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
                 offsetFreeContent, lastPageNum, HEADER_BASE_SIZE, currentPage.getMaxContentSize());
         currentPage.writeByte(OFFSET_MUTABLE, (byte) 0);
         lastPageNum++;
+        currentInsertPageNum = lastPageNum; // Track the new page number
         currentPage = createNewVectorDataPage(lastPageNum);
         offsetFreeContent = currentPage.readInt(OFFSET_FREE_CONTENT);
         numberOfEntries = 0;
@@ -1330,6 +1530,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
         currentPage.writeByte(OFFSET_MUTABLE, (byte) 0); // mutable = 0
 
         lastPageNum++;
+        currentInsertPageNum = lastPageNum; // Track the new page number
         currentPage = createNewVectorDataPage(lastPageNum);
         offsetFreeContent = currentPage.readInt(OFFSET_FREE_CONTENT);
         numberOfEntries = 0;
@@ -1346,10 +1547,14 @@ public class LSMVectorIndex implements Index, IndexInternal {
       bytesWritten += currentPage.writeNumber(offsetFreeContent + bytesWritten, rid.getPosition());
       bytesWritten += currentPage.writeByte(offsetFreeContent + bytesWritten, (byte) 0); // not deleted
 
+      // CRITICAL FIX: Always write quantization type byte, even if NONE
+      // This ensures readVectorFromOffset() can always read a consistent format
+      final VectorQuantizationType quantType = (qmeta != null) ? qmeta.getType() : VectorQuantizationType.NONE;
+      final byte quantOrdinal = (byte) quantType.ordinal();
+      bytesWritten += currentPage.writeByte(offsetFreeContent + bytesWritten, quantOrdinal);
+
       // Write quantized vector data if quantization is enabled
       if (qmeta != null) {
-        // Write quantization type flag
-        bytesWritten += currentPage.writeByte(offsetFreeContent + bytesWritten, (byte) qmeta.getType().ordinal());
 
         if (qmeta.getType() == VectorQuantizationType.INT8) {
           final VectorQuantizationMetadata.Int8QuantizationMetadata int8meta = (VectorQuantizationMetadata.Int8QuantizationMetadata) qmeta;
@@ -1406,11 +1611,16 @@ public class LSMVectorIndex implements Index, IndexInternal {
       if (deletedIds.isEmpty())
         return;
 
-      // Get or create the last mutable page
-      int lastPageNum = getTotalPages() - 1;
+      // Use tracked page number to handle transaction-local pages correctly
+      int lastPageNum = currentInsertPageNum;
       if (lastPageNum < 0) {
-        lastPageNum = 0;
-        createNewVectorDataPage(lastPageNum);
+        // First operation in this session - initialize from persisted pages
+        lastPageNum = getTotalPages() - 1;
+        if (lastPageNum < 0) {
+          lastPageNum = 0;
+          createNewVectorDataPage(lastPageNum);
+        }
+        currentInsertPageNum = lastPageNum;
       }
 
       // Append deletion tombstones to pages
@@ -1441,6 +1651,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
                   offsetFreeContent, lastPageNum, HEADER_BASE_SIZE, currentPage.getMaxContentSize());
           currentPage.writeByte(OFFSET_MUTABLE, (byte) 0);
           lastPageNum++;
+          currentInsertPageNum = lastPageNum; // Track the new page number
           currentPage = createNewVectorDataPage(lastPageNum);
           offsetFreeContent = currentPage.readInt(OFFSET_FREE_CONTENT);
           numberOfEntries = 0;
@@ -1454,6 +1665,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
           currentPage.writeByte(OFFSET_MUTABLE, (byte) 0);
 
           lastPageNum++;
+          currentInsertPageNum = lastPageNum; // Track the new page number
           currentPage = createNewVectorDataPage(lastPageNum);
           offsetFreeContent = currentPage.readInt(OFFSET_FREE_CONTENT);
           numberOfEntries = 0;
@@ -1576,7 +1788,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
    */
   private float calculateMedian(final float[] values) {
     final float[] sorted = values.clone();
-    java.util.Arrays.sort(sorted);
+    Arrays.sort(sorted);
     if (sorted.length % 2 == 0) {
       return (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2.0f;
     } else {
@@ -1678,8 +1890,14 @@ public class LSMVectorIndex implements Index, IndexInternal {
         return null;
 
       // Calculate page number and offset within page
-      final int pageNum = (int) (fileOffset / getPageSize());
-      final int offsetInPage = (int) (fileOffset % getPageSize()) - BasePage.PAGE_HEADER_SIZE;
+      final int pageSize = getPageSize();
+      final int pageNum = (int) (fileOffset / pageSize);
+      // NOTE: BasePage read methods automatically add PAGE_HEADER_SIZE, so we don't subtract it here
+      final int offsetInPage = (int) (fileOffset % pageSize);
+
+      // CRITICAL: BasePage.read methods automatically add PAGE_HEADER_SIZE to the index,
+      // so we need to pass the offset relative to the start of the page CONTENT (after header)
+      final int contentOffset = offsetInPage - BasePage.PAGE_HEADER_SIZE;
 
       // Get the appropriate file ID
       final int fileId = isCompacted ? compactedSubIndex.getFileId() : getFileId();
@@ -1691,7 +1909,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
       try {
         // Skip over the entry header (vectorId, bucketId, position, deleted flag)
         // These are variable-sized, so we need to read and skip them
-        int pos = offsetInPage;
+        // NOTE: All positions here are relative to page content (after PAGE_HEADER_SIZE)
+        int pos = contentOffset;
 
         // Read and skip vectorId
         final long[] vectorIdAndSize = page.readNumberAndSize(pos);
@@ -1708,6 +1927,10 @@ public class LSMVectorIndex implements Index, IndexInternal {
         // Read quantization type flag
         final byte quantTypeOrdinal = page.readByte(pos);
         pos += 1;
+
+        // Validate quantization type ordinal before converting to enum
+        if (quantTypeOrdinal < 0 || quantTypeOrdinal >= VectorQuantizationType.values().length)
+          return null;
 
         final VectorQuantizationType quantType = VectorQuantizationType.values()[quantTypeOrdinal];
 
@@ -1755,6 +1978,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
           return dequantizeFromBinary(packed, qmeta);
         }
 
+        // quantType is NONE - return null (caller should fetch from document)
         return null;
 
       } finally {
@@ -1815,20 +2039,25 @@ public class LSMVectorIndex implements Index, IndexInternal {
    * @return List of pairs containing RID and similarity score
    */
   public List<Pair<RID, Float>> findNeighborsFromVector(final float[] queryVector, final int k, final Set<RID> allowedRIDs) {
-    if (queryVector == null)
-      throw new IllegalArgumentException("Query vector cannot be null");
+    // Track search metrics
+    final long startTime = System.currentTimeMillis();
+    searchOperations.incrementAndGet();
 
-    if (queryVector.length != metadata.dimensions)
-      throw new IllegalArgumentException(
-          "Query vector dimension " + queryVector.length + " does not match index dimension " + metadata.dimensions);
-
-    // Ensure graph is available (lazy-load from disk if needed, or build if not persisted)
-    ensureGraphAvailable();
-
-    boolean readLockHeld = false;
-    lock.readLock().lock();
-    readLockHeld = true;
     try {
+      if (queryVector == null)
+        throw new IllegalArgumentException("Query vector cannot be null");
+
+      if (queryVector.length != metadata.dimensions)
+        throw new IllegalArgumentException(
+            "Query vector dimension " + queryVector.length + " does not match index dimension " + metadata.dimensions);
+
+      // Ensure graph is available (lazy-load from disk if needed, or build if not persisted)
+      ensureGraphAvailable();
+
+      boolean readLockHeld = false;
+      lock.readLock().lock();
+      readLockHeld = true;
+      try {
       // Phase 5+: Check if graph needs rebuilding due to pending mutations
       // With periodic rebuilds (threshold=1000), we may have some pending mutations
       if (graphState == GraphState.MUTABLE && mutationsSinceSerialize.get() > 0) {
@@ -1871,6 +2100,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
           new RIDBitsFilter(allowedRIDs, ordinalToVectorId, vectorIndex) :
           Bits.ALL;
 
+      // TODO: Use instance GraphSearcher method with metadata.efSearch parameter for better recall control
+      // Current static method uses default efSearch behavior
       final SearchResult searchResult = GraphSearcher.search(queryVectorFloat, k, vectors, metadata.similarityFunction, graphIndex,
           bitsFilter);
 
@@ -1902,7 +2133,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
                   -score;
               default -> score;
             };
-            results.add(new com.arcadedb.utility.Pair<>(loc.rid, distance));
+            results.add(new Pair<>(loc.rid, distance));
           } else {
             skippedDeletedOrNull++;
           }
@@ -1916,13 +2147,18 @@ public class LSMVectorIndex implements Index, IndexInternal {
               skippedOutOfBounds, skippedDeletedOrNull);
       return results;
 
-    } catch (final Exception e) {
-      LogManager.instance().log(this, Level.SEVERE, "Error performing vector search", e);
-      throw new IndexException("Error performing vector search", e);
-    } finally {
-      if (readLockHeld) {
-        lock.readLock().unlock();
+      } catch (final Exception e) {
+        LogManager.instance().log(this, Level.SEVERE, "Error performing vector search", e);
+        throw new IndexException("Error performing vector search", e);
+      } finally {
+        if (readLockHeld) {
+          lock.readLock().unlock();
+        }
       }
+    } finally {
+      // Track search latency
+      final long elapsed = System.currentTimeMillis() - startTime;
+      searchLatencyMs.addAndGet(elapsed);
     }
   }
 
@@ -2110,15 +2346,25 @@ public class LSMVectorIndex implements Index, IndexInternal {
 
   @Override
   public void put(final Object[] keys, final RID[] values) {
+    // Track insert metrics
+    final long startTime = System.currentTimeMillis();
+    insertOperations.incrementAndGet();
 
-    if (keys == null || keys.length == 0)
-      throw new IllegalArgumentException("Keys cannot be null or empty");
+    try {
+      if (keys == null || keys.length == 0)
+        throw new IllegalArgumentException("Keys cannot be null or empty");
 
-    if (values == null || values.length == 0)
-      throw new IllegalArgumentException("Values cannot be null or empty");
+      // Handle null keys according to null strategy
+      if (keys[0] == null) {
+        // Vector indexes always use SKIP strategy - silently skip null values
+        return;
+      }
 
-    // Validate vector - can be either float[] or ComparableVector (from transaction replay)
-    final float[] vector;
+      if (values == null || values.length == 0)
+        throw new IllegalArgumentException("Values cannot be null or empty");
+
+      // Validate vector - can be either float[] or ComparableVector (from transaction replay)
+      final float[] vector;
     if (keys[0] instanceof ComparableVector c)
       vector = c.vector;
     else
@@ -2134,14 +2380,14 @@ public class LSMVectorIndex implements Index, IndexInternal {
           "Vector dimension " + vector.length + " does not match index dimension " + metadata.dimensions);
 
     final RID rid = values[0];
-    final com.arcadedb.database.TransactionContext.STATUS txStatus = getDatabase().getTransaction().getStatus();
+    final TransactionContext.STATUS txStatus = getDatabase().getTransaction().getStatus();
 
-    if (txStatus == com.arcadedb.database.TransactionContext.STATUS.BEGUN) {
+    if (txStatus == TransactionContext.STATUS.BEGUN) {
       // During BEGUN: Register with TransactionIndexContext for file locking and transaction tracking
       // Wrap vector in ComparableVector for TransactionIndexContext's TreeMap
       // TransactionIndexContext will replay this operation during commit, which will hit the else branch below
       getDatabase().getTransaction()
-          .addIndexOperation(this, com.arcadedb.database.TransactionIndexContext.IndexKey.IndexKeyOperation.ADD,
+          .addIndexOperation(this, TransactionIndexContext.IndexKey.IndexKeyOperation.ADD,
               new Object[] { new ComparableVector(vector) }, rid);
 
     } else {
@@ -2167,9 +2413,19 @@ public class LSMVectorIndex implements Index, IndexInternal {
         // rebuildGraphIfNeeded() calls buildGraphFromScratch() which clears vectorIndex and
         // tries to reload from pages, but pages aren't visible yet during commit phase
         // The graph will be rebuilt on the next query via ensureGraphAvailable() / get()
+        // Phase 2: When storeVectorsInGraph is enabled, the rebuilt graph will fetch updated vectors
+        // from documents/quantized pages and store them inline in the new graph file
         // rebuildGraphIfNeeded();
       } finally {
         lock.writeLock().unlock();
+      }
+    }
+    } finally {
+      // Track insert latency (only for actual writes, not transaction registration)
+      final TransactionContext.STATUS txStatus = getDatabase().getTransaction().getStatus();
+      if (txStatus != TransactionContext.STATUS.BEGUN) {
+        final long elapsed = System.currentTimeMillis() - startTime;
+        insertLatencyMs.addAndGet(elapsed);
       }
     }
   }
@@ -2183,14 +2439,14 @@ public class LSMVectorIndex implements Index, IndexInternal {
   @Override
   public void remove(final Object[] keys, final Identifiable value) {
     final RID rid = value.getIdentity();
-    final com.arcadedb.database.TransactionContext.STATUS txStatus = getDatabase().getTransaction().getStatus();
+    final TransactionContext.STATUS txStatus = getDatabase().getTransaction().getStatus();
 
-    if (txStatus == com.arcadedb.database.TransactionContext.STATUS.BEGUN) {
+    if (txStatus == TransactionContext.STATUS.BEGUN) {
       // During BEGUN: Register with TransactionIndexContext for file locking and transaction tracking
       // Use a dummy ComparableVector since we don't have the vector value for removes
       // TransactionIndexContext will replay this operation during commit, which will hit the else branch below
       getDatabase().getTransaction()
-          .addIndexOperation(this, com.arcadedb.database.TransactionIndexContext.IndexKey.IndexKeyOperation.REMOVE,
+          .addIndexOperation(this, TransactionIndexContext.IndexKey.IndexKeyOperation.REMOVE,
               new Object[] { new ComparableVector(new float[metadata.dimensions]) }, rid);
 
     } else {
@@ -2288,6 +2544,16 @@ public class LSMVectorIndex implements Index, IndexInternal {
 
   public String getComponentName() {
     return mutable.getName();
+  }
+
+  /**
+   * Get the current graph index (for Phase 2: reading vectors from graph file).
+   * Package-private to allow access from ArcadePageVectorValues.
+   *
+   * @return The current graph index (may be OnHeapGraphIndex or OnDiskGraphIndex)
+   */
+  ImmutableGraphIndex getGraphIndex() {
+    return graphIndex;
   }
 
   @Override
@@ -2402,7 +2668,12 @@ public class LSMVectorIndex implements Index, IndexInternal {
 
     try {
       LogManager.instance().log(this, Level.INFO, "compact() calling LSMVectorIndexCompactor.compact()");
-      return LSMVectorIndexCompactor.compact(this);
+      final boolean success = LSMVectorIndexCompactor.compact(this);
+      if (success) {
+        // Track successful compaction
+        compactionCount.incrementAndGet();
+      }
+      return success;
     } catch (final TimeoutException e) {
       LogManager.instance().log(this, Level.INFO, "compact() caught TimeoutException: %s", e.getMessage());
       // IGNORE IT, WILL RETRY LATER
@@ -2428,12 +2699,15 @@ public class LSMVectorIndex implements Index, IndexInternal {
     json.put("properties", metadata.propertyNames);
     json.put("dimensions", metadata.dimensions);
     json.put("similarityFunction", metadata.similarityFunction.name());
+
     if (metadata.quantizationType != VectorQuantizationType.NONE)
       json.put("quantization", metadata.quantizationType.name());
     json.put("maxConnections", metadata.maxConnections);
     json.put("beamWidth", metadata.beamWidth);
     json.put("idPropertyName", metadata.idPropertyName);
+    json.put("storeVectorsInGraph", metadata.storeVectorsInGraph);
     json.put("version", CURRENT_VERSION);
+
     return json;
   }
 
@@ -2511,6 +2785,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
       // Clear all vector locations
       vectorIndex.clear();
       ordinalToVectorId = new int[0];
+      currentInsertPageNum = -1;
 
       final DatabaseInternal db = mutable != null ? mutable.getDatabase() : null;
 
@@ -2575,12 +2850,56 @@ public class LSMVectorIndex implements Index, IndexInternal {
   @Override
   public Map<String, Long> getStats() {
     final Map<String, Long> stats = new HashMap<>();
+
+    // Existing metrics
     stats.put("totalVectors", (long) vectorIndex.size());
     stats.put("activeVectors", vectorIndex.getActiveCount());
     stats.put("deletedVectors", (long) vectorIndex.size() - vectorIndex.getActiveCount());
     stats.put("dimensions", (long) metadata.dimensions);
     stats.put("maxConnections", (long) metadata.maxConnections);
     stats.put("beamWidth", (long) metadata.beamWidth);
+
+    // NEW: Graph state metrics
+    stats.put("graphState", (long) graphState.ordinal()); // LOADING=0, IMMUTABLE=1, MUTABLE=2
+    stats.put("graphNodeCount", graphIndex != null ? (long) graphIndex.getIdUpperBound() : 0L);
+    stats.put("mutationsSinceRebuild", (long) mutationsSinceSerialize.get());
+
+    // Calculate mutations threshold (use configured value or default)
+    final int defaultMutationsThreshold = getDatabase().getConfiguration()
+        .getValueAsInteger(GlobalConfiguration.VECTOR_INDEX_MUTATIONS_BEFORE_REBUILD);
+    stats.put("mutationsThreshold", metadata.mutationsBeforeRebuild > 0 ?
+        (long) metadata.mutationsBeforeRebuild : (long) defaultMutationsThreshold);
+
+    // NEW: Operation counters
+    stats.put("searchOperations", searchOperations.get());
+    stats.put("insertOperations", insertOperations.get());
+    stats.put("graphRebuildCount", graphRebuildCount.get());
+    stats.put("compactionCount", compactionCount.get());
+
+    // NEW: Cache statistics
+    stats.put("vectorCacheHits", vectorCacheHits.get());
+    stats.put("vectorCacheMisses", vectorCacheMisses.get());
+
+    // NEW: Vector fetch source tracking
+    stats.put("vectorFetchFromQuantized", vectorFetchFromQuantized.get());
+    stats.put("vectorFetchFromDocuments", vectorFetchFromDocuments.get());
+    stats.put("vectorFetchFromGraph", vectorFetchFromGraph.get());
+
+    // NEW: Performance metrics (average latencies)
+    final long searchOps = searchOperations.get();
+    final long insertOps = insertOperations.get();
+    stats.put("avgSearchLatencyMs", searchOps > 0 ? searchLatencyMs.get() / searchOps : 0L);
+    stats.put("avgInsertLatencyMs", insertOps > 0 ? insertLatencyMs.get() / insertOps : 0L);
+
+    // NEW: Memory estimates
+    stats.put("estimatedLocationIndexBytes", (long) vectorIndex.size() * 24L);
+    stats.put("estimatedOrdinalMapBytes", ordinalToVectorId != null ?
+        (long) ordinalToVectorId.length * 4L : 0L);
+
+    // NEW: Page statistics
+    stats.put("mutablePages", (long) currentMutablePages.get());
+    stats.put("compactedPages", compactedSubIndex != null ? (long) compactedSubIndex.getTotalPages() : 0L);
+
     return stats;
   }
 
@@ -2601,6 +2920,10 @@ public class LSMVectorIndex implements Index, IndexInternal {
   public void setMetadata(final IndexMetadata metadata) {
     checkIsValid();
     this.metadata = (LSMVectorIndexMetadata) metadata;
+
+    // DEBUG: Log metadata being set
+    LogManager.instance().log(this, Level.SEVERE,
+        "DEBUG: setMetadata called for index %s, quantizationType=%s", indexName, this.metadata.quantizationType);
   }
 
   @Override
@@ -2638,7 +2961,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
 
           // Check if we need to start a transaction
           final boolean startedTransaction =
-              db.getTransaction().getStatus() != com.arcadedb.database.TransactionContext.STATUS.BEGUN;
+              db.getTransaction().getStatus() != TransactionContext.STATUS.BEGUN;
           if (startedTransaction)
             db.getWrappedDatabaseInstance().begin();
 
@@ -2682,7 +3005,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
             totalRecords = total.get();
           } catch (final Exception e) {
             // Rollback if we started a transaction
-            if (startedTransaction && db.getTransaction().getStatus() == com.arcadedb.database.TransactionContext.STATUS.BEGUN)
+            if (startedTransaction && db.getTransaction().getStatus() == TransactionContext.STATUS.BEGUN)
               db.getWrappedDatabaseInstance().rollback();
             throw e;
           }
@@ -2869,7 +3192,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
    *
    * @param page The page that was just replicated and written
    */
-  public void applyReplicatedPageUpdate(final com.arcadedb.engine.MutablePage page) {
+  public void applyReplicatedPageUpdate(final MutablePage page) {
     try {
       final int pageNum = page.getPageId().getPageNumber();
       final int fileId = page.getPageId().getFileId();
@@ -2969,7 +3292,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
       return metadata.locationCacheSize;
     }
     return mutable.getDatabase().getConfiguration()
-        .getValueAsInteger(com.arcadedb.GlobalConfiguration.VECTOR_INDEX_LOCATION_CACHE_SIZE);
+        .getValueAsInteger(GlobalConfiguration.VECTOR_INDEX_LOCATION_CACHE_SIZE);
   }
 
   /**
@@ -2984,7 +3307,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
     if (metadata != null && metadata.locationCacheSize > -1) {
       return metadata.locationCacheSize;
     }
-    return database.getConfiguration().getValueAsInteger(com.arcadedb.GlobalConfiguration.VECTOR_INDEX_LOCATION_CACHE_SIZE);
+    return database.getConfiguration().getValueAsInteger(GlobalConfiguration.VECTOR_INDEX_LOCATION_CACHE_SIZE);
   }
 
   /**
@@ -2997,7 +3320,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
       return metadata.graphBuildCacheSize;
     }
     return mutable.getDatabase().getConfiguration()
-        .getValueAsInteger(com.arcadedb.GlobalConfiguration.VECTOR_INDEX_GRAPH_BUILD_CACHE_SIZE);
+        .getValueAsInteger(GlobalConfiguration.VECTOR_INDEX_GRAPH_BUILD_CACHE_SIZE);
   }
 
   /**
@@ -3010,7 +3333,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
       return metadata.mutationsBeforeRebuild;
     }
     return mutable.getDatabase().getConfiguration()
-        .getValueAsInteger(com.arcadedb.GlobalConfiguration.VECTOR_INDEX_MUTATIONS_BEFORE_REBUILD);
+        .getValueAsInteger(GlobalConfiguration.VECTOR_INDEX_MUTATIONS_BEFORE_REBUILD);
   }
 
   /**
