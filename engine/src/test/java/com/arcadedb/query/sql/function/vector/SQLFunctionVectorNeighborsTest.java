@@ -154,6 +154,42 @@ class SQLFunctionVectorNeighborsTest extends TestHelper {
   }
 
   @Test
+  void sqlVectorNeighborsWithDocumentType() {
+    database.transaction(() -> {
+      database.command("sql", "CREATE DOCUMENT TYPE DocRecord IF NOT EXISTS");
+      database.command("sql", "CREATE PROPERTY DocRecord.name IF NOT EXISTS STRING");
+      database.command("sql", "CREATE PROPERTY DocRecord.embedding IF NOT EXISTS ARRAY_OF_FLOATS");
+      database.command("sql", """
+          CREATE INDEX IF NOT EXISTS ON DocRecord (embedding) LSM_VECTOR
+          METADATA {
+            dimensions: 3,
+            similarity: 'COSINE',
+            idPropertyName: 'name'
+          }""");
+    });
+
+    database.transaction(() -> {
+      database.command("sql", "INSERT INTO DocRecord SET name = ?, embedding = ?", "docA",
+          new float[] { 1.0f, 0.0f, 0.0f });
+      database.command("sql", "INSERT INTO DocRecord SET name = ?, embedding = ?", "docB",
+          new float[] { 0.9f, 0.1f, 0.0f });
+    });
+
+    String query = "SELECT vectorNeighbors('DocRecord[embedding]', [1.0, 0.0, 0.0], 2) as neighbors";
+    try (ResultSet results = database.query("sql", query)) {
+      assertThat(results.hasNext()).as("Query should return results").isTrue();
+
+      var result = results.next();
+      @SuppressWarnings("unchecked")
+      List<Map<String, Object>> neighbors = result.getProperty("neighbors");
+
+      assertThat(neighbors).isNotNull();
+      assertThat(neighbors).as("Should find neighbors").isNotEmpty();
+      assertThat(neighbors.getFirst().containsKey("record")).as("Result should contain 'record' key").isTrue();
+    }
+  }
+
+  @Test
   void vectorNeighborsLimitParameter() {
 
     final SQLFunctionVectorNeighbors function = new SQLFunctionVectorNeighbors();

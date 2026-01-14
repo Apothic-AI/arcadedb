@@ -18,6 +18,7 @@
  */
 package com.arcadedb.query.sql.function.vector;
 
+import com.arcadedb.database.Document;
 import com.arcadedb.database.Identifiable;
 import com.arcadedb.database.RID;
 import com.arcadedb.exception.CommandSQLParsingException;
@@ -27,6 +28,8 @@ import com.arcadedb.index.TypeIndex;
 import com.arcadedb.index.vector.LSMVectorIndex;
 import com.arcadedb.query.sql.executor.CommandContext;
 import com.arcadedb.query.sql.executor.ResultSet;
+import com.arcadedb.schema.DocumentType;
+import com.arcadedb.schema.VertexType;
 import com.arcadedb.utility.Pair;
 
 import java.util.ArrayList;
@@ -113,11 +116,20 @@ public class SQLFunctionVectorNeighbors extends SQLFunctionVectorAbstract {
     final List<Pair<RID, Float>> neighbors = lsmIndex.findNeighborsFromVector(queryVector, limit);
     final ArrayList<Object> result = new ArrayList<>(neighbors.size());
 
+    final String typeName = lsmIndex.getTypeName();
+    final DocumentType type = context.getDatabase().getSchema().getType(typeName);
+    final boolean returnVertex = type instanceof VertexType;
+
     for (final Pair<RID, Float> neighbor : neighbors) {
       final RID rid = neighbor.getFirst();
-      final Vertex vertex = rid.asVertex();
       final float distance = neighbor.getSecond();
-      result.add(Map.of("vertex", vertex, "distance", distance));
+      if (returnVertex) {
+        final Vertex vertex = rid.asVertex();
+        result.add(Map.of("vertex", vertex, "distance", distance));
+      } else {
+        final Document record = rid.asDocument();
+        result.add(Map.of("record", record, "distance", distance));
+      }
     }
 
     return result;
